@@ -1,0 +1,729 @@
+<script>
+// ============================================================
+//  Plant Monitor — Dashboard JS  v4.2
+//  แก้ไข: Avail Panel แสดงช่วงเวลา (hour buckets) แทนวันที่
+// ============================================================
+const REFRESH_MS    = 15000;
+const STALE_TIMEOUT = 60000;
+const MAX_POINTS    = 5000;
+
+let staleTimer    = null;
+let allPoints     = [];
+let soundChart    = null;
+let selectedFile  = null;
+let graphRange    = 10;
+let filterDate    = null;
+let filterHourStart = null;  // เพิ่ม: ช่วงเวลาเริ่มต้น (0-23) หรือ null = ทั้งวัน
+let filterHourEnd   = null;  // เพิ่ม: ช่วงเวลาสิ้นสุด (0-23) หรือ null = ทั้งวัน
+let currentSheet  = '';
+let slots         = [];
+let sessionActive = false;
+let sessionEnd    = null;
+let sessionTimer  = null;
+
+// ── Boot ─────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  const dp = document.getElementById('graph-date');
+  if (dp) { dp.value = new Date().toISOString().split('T')[0]; filterDate = dp.value; }
+  loadSheetList();
+  loadConfig();
+  checkBoardOnline();
+  setInterval(() => { fetchLatest(); fetchHistory(); }, REFRESH_MS);
+  setInterval(loadConfig, 30000);
+  setInterval(updateSessionBar, 1000);
+  setInterval(checkBoardOnline, 15000);
+});
+
+// ── เช็คว่า ESP32 online ──────────────────────────────────────
+function checkBoardOnline() {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (!currentSheet) return;
+      google.script.run
+        .withSuccessHandler(r => {
+          if (!r || r.status === 'error') { setBadgeConn(false); return; }
+          if (r.status === 'empty')       { setBadgeConn(false); return; }
+          const ts = r.data && r.data.timestamp ? new Date(r.data.timestamp) : null;
+          if (!ts) { setBadgeConn(false); return; }
+          setBadgeConn(Date.now() - ts.getTime() < 60000);
+        })
+        .withFailureHandler(() => setBadgeConn(false))
+        .getLatestData(currentSheet);
+    })
+    .withFailureHandler(() => setBadgeConn(false))
+    .getConfig();
+}
+
+// ── Config ────────────────────────────────────────────────────
+function loadConfig() {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.status !== 'ok') return;
+      slots = res.slots || [];
+      renderSlots();
+      sessionActive = res.sessionActive || false;
+      const endStr = res.sessionEnd || '';
+      sessionEnd = (endStr !== '') ? new Date(endStr) : null;
+      if (sessionEnd && new Date() >= sessionEnd) { sessionActive = false; sessionEnd = null; }
+      setBadgeWifi(res.wifiOnline || false);
+      setBadgeRec(res.recording  || false);
+      updateSessionBar();
+      updateRecordButtons();
+    })
+    .withFailureHandler(() => {})
+    .getConfig();
+}
+
+// ── Session bar ───────────────────────────────────────────────
+function updateSessionBar() {
+  const bar  = document.getElementById('session-bar');
+  const stat = document.getElementById('session-status');
+  if (!bar || !stat) return;
+  if (sessionActive && sessionEnd && new Date() < sessionEnd) {
+    const rem = Math.max(0, sessionEnd - new Date());
+    const hh  = String(Math.floor(rem/3600000)).padStart(2,'0');
+    const mm  = String(Math.floor((rem%3600000)/60000)).padStart(2,'0');
+    const ss  = String(Math.floor((rem%60000)/1000)).padStart(2,'0');
+    bar.className = 'session-bar';
+    stat.textContent = '🔴 กำลังบันทึก — เหลือ ' + hh + ':' + mm + ':' + ss;
+  } else {
+    if (sessionActive && sessionEnd && new Date() >= sessionEnd) sessionActive = false;
+    bar.className = 'session-bar inactive';
+    stat.textContent = 'ไม่มี session ที่ทำงานอยู่';
+  }
+}
+
+function updateRecordButtons() {
+  const stopBtn = document.getElementById('btn-stop');
+  if (stopBtn) stopBtn.disabled = !sessionActive;
+}
+
+// ── Sheet selector ────────────────────────────────────────────
+function loadSheetList() {
+  google.script.run
+    .withSuccessHandler(res => {
+      const sel = document.getElementById('sheet-select');
+      if (!sel || res.status !== 'ok') return;
+      sel.innerHTML = '';
+      const sheets = res.sheets || [];
+      sheets.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      if (!currentSheet && sheets.length > 0) {
+        const raw = sheets.filter(n => n.startsWith('RAW_'));
+        currentSheet = raw.length > 0 ? raw[raw.length-1] : sheets[0];
+      }
+      sel.value = currentSheet;
+      updateSheetBadge();
+      fetchLatest(); fetchHistory();
+    })
+    .withFailureHandler(() => {})
+    .getSheetList();
+}
+
+function onSheetChange() {
+  const sel = document.getElementById('sheet-select');
+  if (!sel) return;
+  currentSheet = sel.value;
+  updateSheetBadge(); clearUI(); fetchLatest(); fetchHistory();
+}
+
+function updateSheetBadge() {
+  const b = document.getElementById('chart-sheet-badge');
+  if (b) b.textContent = currentSheet;
+}
+
+// ── สร้าง sheet ใหม่ ──────────────────────────────────────────
+function openNewSheetModal() {
+  const ov = document.getElementById('modal-overlay');
+  const inp = document.getElementById('new-sheet-name');
+  const err = document.getElementById('modal-error');
+  if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 80); }
+  if (err) err.style.display = 'none';
+  if (ov)  ov.style.display  = 'flex';
+}
+function closeNewSheetModal() {
+  const ov = document.getElementById('modal-overlay');
+  if (ov) ov.style.display = 'none';
+}
+function submitNewSheet() {
+  const inp  = document.getElementById('new-sheet-name');
+  const err  = document.getElementById('modal-error');
+  const okb  = document.getElementById('modal-btn-ok');
+  const name = (inp ? inp.value : '').trim();
+  if (!name) { if (err) { err.textContent = 'กรุณากรอกชื่อ Sheet'; err.style.display = ''; } return; }
+  if (err) err.style.display = 'none';
+  if (okb) okb.disabled = true;
+  google.script.run
+    .withSuccessHandler(res => {
+      if (okb) okb.disabled = false;
+      if (res.status === 'ok') {
+        closeNewSheetModal();
+        currentSheet = res.sheet;
+        loadSheetList();
+        setTimeout(() => {
+          const sel = document.getElementById('sheet-select');
+          if (sel) { sel.value = currentSheet; updateSheetBadge(); }
+          clearUI(); fetchLatest(); fetchHistory();
+        }, 400);
+      } else {
+        if (err) { err.textContent = res.message || 'เกิดข้อผิดพลาด'; err.style.display = ''; }
+      }
+    })
+    .withFailureHandler(e => {
+      if (okb) okb.disabled = false;
+      if (err) { err.textContent = 'ไม่สามารถสร้าง Sheet: ' + e; err.style.display = ''; }
+    })
+    .createNewSheet(name);
+}
+
+// ── Record / Stop / Reset ─────────────────────────────────────
+function triggerRecordESP32() {
+  const btn   = document.getElementById('btn-record');
+  const label = document.getElementById('btn-record-label');
+  if (btn) { btn.disabled = true; btn.classList.add('recording'); }
+  if (label) label.textContent = 'กำลังส่ง…';
+  google.script.run
+    .withSuccessHandler(res => {
+      if (btn) { btn.disabled = false; btn.classList.remove('recording'); }
+      if (label) label.textContent = 'อัดเสียง';
+      if (res.status === 'ok') {
+        sessionActive = true;
+        sessionEnd    = new Date(Date.now() + 2 * 3600000);
+        updateSessionBar(); updateRecordButtons();
+        showToast('✓ ส่งคำสั่งแล้ว ESP32 จะอัดในรอบถัดไป', 'ok');
+      } else {
+        showToast('⚠ ' + res.message, 'err');
+      }
+    })
+    .withFailureHandler(e => {
+      if (btn) { btn.disabled = false; btn.classList.remove('recording'); }
+      if (label) label.textContent = 'อัดเสียง';
+      showToast('⚠ ' + e, 'err');
+    })
+    .setRecordFlag();
+}
+
+function stopSession() {
+  if (!confirm('หยุด session การอัดเสียง?')) return;
+  google.script.run
+    .withSuccessHandler(res => {
+      sessionActive = false; sessionEnd = null;
+      updateSessionBar(); updateRecordButtons();
+      showToast('✓ หยุด session แล้ว', 'ok');
+    })
+    .withFailureHandler(e => showToast('⚠ ' + e, 'err'))
+    .stopSessionClient();
+}
+
+function resetBoard() {
+  if (!confirm('รีเซ็ต ESP32 บอร์ด?')) return;
+  google.script.run
+    .withSuccessHandler(res => showToast(res.status==='ok'?'✓ ส่งคำสั่ง reset แล้ว':'⚠ '+res.message, res.status==='ok'?'ok':'err'))
+    .withFailureHandler(e => showToast('⚠ ' + e, 'err'))
+    .setResetFlag();
+}
+
+// ── Time Slots ────────────────────────────────────────────────
+function renderSlots() {
+  const list = document.getElementById('slot-list');
+  if (!list) return;
+  if (!slots.length) { list.innerHTML = '<div class="slot-empty">ยังไม่มีช่วงเวลา</div>'; return; }
+  list.innerHTML = '';
+  slots.forEach((s, i) => {
+    const div = document.createElement('div');
+    div.className = 'slot-item';
+    div.innerHTML = '<span class="slot-time">' + s.start + ' – ' + s.end + '</span>' +
+      '<button class="slot-del" onclick="deleteSlot(' + i + ')" title="ลบ">✕</button>';
+    list.appendChild(div);
+  });
+}
+
+function addSlot() {
+  const start = document.getElementById('slot-start').value;
+  const end   = document.getElementById('slot-end').value;
+  if (!start || !end) { showToast('กรอกเวลาให้ครบ', 'err'); return; }
+  if (start >= end)   { showToast('เวลาเริ่มต้องน้อยกว่าสิ้นสุด', 'err'); return; }
+  slots.push({ start, end }); saveSlots();
+}
+
+function deleteSlot(i) { slots.splice(i, 1); saveSlots(); }
+
+function saveSlots() {
+  google.script.run
+    .withSuccessHandler(res => { slots = res.slots || []; renderSlots(); showToast('✓ บันทึก time slots แล้ว', 'ok'); })
+    .withFailureHandler(e => showToast('⚠ ' + e, 'err'))
+    .setSlots(JSON.stringify(slots));
+}
+
+// ── Fetch ─────────────────────────────────────────────────────
+function fetchLatest() {
+  if (!currentSheet) return;
+  google.script.run
+    .withSuccessHandler(onLatest)
+    .withFailureHandler(() => setDisconnected())
+    .getLatestData(currentSheet);
+}
+function fetchHistory() {
+  if (!currentSheet) return;
+  google.script.run
+    .withSuccessHandler(onHistory)
+    .withFailureHandler(() => {})
+    .getHistoryData(MAX_POINTS, currentSheet);
+}
+
+function onLatest(res) {
+  if (!res || res.status === 'empty' || res.status === 'error') { setDisconnected(); return; }
+  const d = res.data;
+  const rowTime = d.timestamp ? new Date(d.timestamp).getTime() : 0;
+  if (Date.now() - rowTime >= STALE_TIMEOUT) { setDisconnected(); return; }
+  if (staleTimer) clearTimeout(staleTimer);
+  staleTimer = setTimeout(() => setDisconnected(), STALE_TIMEOUT);
+  setBadgeConn(true);
+  const t = parseFloat(d.temp);
+  setHTML('val-temp', isNaN(t) ? '--<span class="unit">°C</span>' : t.toFixed(1) + '<span class="unit">°C</span>');
+  const h = parseFloat(d.hum);
+  setHTML('val-hum', isNaN(h) ? '--<span class="unit">%</span>' : h.toFixed(1) + '<span class="unit">%</span>');
+  const rec = (d.record||'').toUpperCase();
+  const recEl = document.getElementById('val-record');
+  if (recEl) { recEl.textContent = rec||'—'; recEl.className = 'status-big '+(rec==='COMPLETE'?'s-green':rec==='FAIL'?'s-red':'s-orange'); }
+  const recSb = document.getElementById('sub-record');
+  if (recSb) recSb.textContent = rec==='COMPLETE'?'บันทึกครบ 10 วินาที':rec==='FAIL'?'บันทึกไม่สำเร็จ':'—';
+  const sd = (d.sd||'').toUpperCase();
+  const sdEl = document.getElementById('val-sd');
+  if (sdEl) { sdEl.textContent = sd==='READY'?'READY':(sd||'ERROR'); sdEl.className = 'status-big '+(sd==='READY'?'s-green':'s-red'); }
+  const sdSb = document.getElementById('sub-sd');
+  if (sdSb) sdSb.textContent = sd==='READY'?'การ์ดพร้อมใช้งาน':'ไม่พบการ์ด SD';
+  setText('val-filename', d.filename||'—');
+  if (d.timestamp) setText('last-ts', 'อัปเดต: ' + fmtTime(new Date(d.timestamp)));
+}
+
+function onHistory(res) {
+  if (!res || res.status === 'empty' || res.status === 'error') { clearAvailPanel(); return; }
+  const rows = [...(res.rows||[])].slice(-MAX_POINTS);
+  const tbody = document.getElementById('hist-body');
+  if (tbody) {
+    tbody.innerHTML = '';
+    [...rows].slice(-30).reverse().forEach(d => {
+      const ts  = d.timestamp ? fmtTime(new Date(d.timestamp)) : '—';
+      const rec = (d.record||'').toUpperCase();
+      const rCls = rec==='COMPLETE'?'td-green':rec==='FAIL'?'td-red':'td-orange';
+      const dbV = parseFloat(d.db);
+      const tr  = document.createElement('tr');
+      tr.innerHTML = `<td class="td-blue">${ts}</td><td>${fmtN(d.temp,1)}°</td><td>${fmtN(d.hum,1)}%</td><td class="${rCls}">${rec||'—'}</td><td>${isNaN(dbV)?'—':dbV.toFixed(1)}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+  allPoints = rows.map(d => ({
+    time: d.timestamp ? new Date(d.timestamp) : null,
+    db: parseFloat(d.db)||0, rms: parseFloat(d.rms)||0, amp: parseFloat(d.amplitude)||0,
+    filename: d.filename||'', record: (d.record||'').toUpperCase(),
+    temp: isNaN(parseFloat(d.temp))?null:parseFloat(d.temp),
+    hum:  isNaN(parseFloat(d.hum)) ?null:parseFloat(d.hum)
+  })).filter(p => p.time);
+  buildAvailPanel();
+  renderDayChart();
+}
+
+// ── Avail Panel (แสดงช่วงเวลาภายในวัน) ──────────────────────
+function buildAvailPanel() {
+  const ph    = document.getElementById('avail-placeholder');
+  const chips = document.getElementById('avail-chips');
+  const bars  = document.getElementById('avail-bars');
+  const total = document.getElementById('avail-total');
+  if (!chips) return;
+
+  // 1) รวบรวม date ที่มีข้อมูล
+  const dayMap = {};
+  allPoints.forEach(p => {
+    const y = toYMD(p.time);
+    if (!dayMap[y]) dayMap[y] = { count: 0, points: [] };
+    dayMap[y].count++;
+    dayMap[y].points.push(p);
+  });
+  const days = Object.keys(dayMap).sort();
+
+  if (!days.length) {
+    if (ph) ph.style.display = 'block';
+    chips.style.display = 'none';
+    if (bars) bars.style.display = 'none';
+    if (total) total.textContent = '';
+    return;
+  }
+
+  if (ph) ph.style.display = 'none';
+
+  // ── ส่วนบน: day selector (เลือกวัน) ───────────────────────
+  let dayContainer = document.getElementById('avail-day-chips');
+  if (!dayContainer) {
+    dayContainer = document.createElement('div');
+    dayContainer.id = 'avail-day-chips';
+    dayContainer.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;';
+    chips.parentNode.insertBefore(dayContainer, chips);
+  }
+  dayContainer.style.display = 'flex';
+
+  // ── day chip label ──────────────────────────────────────────
+  let dayLabel = document.getElementById('avail-day-label');
+  if (!dayLabel) {
+    dayLabel = document.createElement('div');
+    dayLabel.id = 'avail-day-label';
+    dayLabel.style.cssText = 'font-size:.65rem;color:var(--text-sm);font-family:var(--mono);margin-bottom:6px;letter-spacing:.5px;';
+    chips.parentNode.insertBefore(dayLabel, dayContainer);
+  }
+  dayLabel.textContent = 'เลือกวัน';
+  dayLabel.style.display = 'block';
+
+  dayContainer.innerHTML = '';
+  days.forEach(ymd => {
+    const info = dayMap[ymd];
+    const isToday = ymd === new Date().toISOString().split('T')[0];
+    const isSel   = ymd === filterDate;
+    const parts   = ymd.split('-');
+    const chip = document.createElement('button');
+    chip.className = 'day-chip' + (isSel ? ' day-chip-active' : '') + (isToday ? ' day-chip-today' : '');
+    chip.title = ymd + '  ·  ' + info.count + ' records';
+    chip.innerHTML = '<span class="chip-date">' + parts[2] + '/' + parts[1] + '</span><span class="chip-cnt">' + info.count + '</span>';
+    chip.onclick = () => {
+      filterDate = ymd;
+      filterHourStart = null;
+      filterHourEnd   = null;
+      const dp = document.getElementById('graph-date');
+      if (dp) dp.value = ymd;
+      dayContainer.querySelectorAll('.day-chip').forEach(c => c.classList.remove('day-chip-active'));
+      chip.classList.add('day-chip-active');
+      buildHourChips(dayMap[ymd].points, ymd);
+      renderDayChart();
+    };
+    dayContainer.appendChild(chip);
+  });
+
+  if (total) total.textContent = days.length + ' วัน · ' + allPoints.length + ' records';
+
+  // ── ส่วนล่าง: hour chips ────────────────────────────────────
+  chips.style.display = 'flex';
+  if (!filterDate || !dayMap[filterDate]) {
+    chips.innerHTML = '<div class="slot-empty" style="font-size:.75rem;color:var(--text-sm);">เลือกวันเพื่อดูช่วงเวลา</div>';
+    if (bars) bars.style.display = 'none';
+    return;
+  }
+  buildHourChips(dayMap[filterDate].points, filterDate);
+
+  if (bars) bars.style.display = 'none'; // ซ่อน bar chart เดิม (แทนที่ด้วย hour chips)
+}
+
+// ── สร้าง hour chips ภายในวันที่เลือก ────────────────────────
+function buildHourChips(points, ymd) {
+  const chips = document.getElementById('avail-chips');
+  if (!chips) return;
+
+  // สร้าง hour map (0-23)
+  const hourMap = {};
+  points.filter(p => p.db > 0).forEach(p => {
+    const h = p.time.getHours();
+    if (!hourMap[h]) hourMap[h] = { count: 0, dbMax: 0, dbSum: 0 };
+    hourMap[h].count++;
+    hourMap[h].dbSum += p.db;
+    if (p.db > hourMap[h].dbMax) hourMap[h].dbMax = p.db;
+  });
+
+  const hours = Object.keys(hourMap).map(Number).sort((a, b) => a - b);
+
+  // label ช่วงเวลา
+  let hourLabel = document.getElementById('avail-hour-label');
+  if (!hourLabel) {
+    hourLabel = document.createElement('div');
+    hourLabel.id = 'avail-hour-label';
+    hourLabel.style.cssText = 'font-size:.65rem;color:var(--text-sm);font-family:var(--mono);margin-bottom:6px;letter-spacing:.5px;margin-top:8px;';
+    chips.parentNode.insertBefore(hourLabel, chips);
+  }
+  hourLabel.style.display = 'block';
+
+  if (!hours.length) {
+    hourLabel.textContent = 'ไม่มีข้อมูล dB ในวันนี้';
+    chips.innerHTML = '';
+    return;
+  }
+
+  hourLabel.textContent = 'ช่วงเวลา — คลิกเพื่อ filter กราฟ';
+  chips.innerHTML = '';
+
+  // ปุ่ม "ทั้งวัน"
+  const allBtn = document.createElement('button');
+  allBtn.className = 'day-chip' + (filterHourStart === null ? ' day-chip-active' : '');
+  allBtn.style.cssText = 'min-width:52px;';
+  allBtn.innerHTML = '<span class="chip-date" style="font-size:.7rem;">ทั้งวัน</span><span class="chip-cnt">' + points.filter(p => p.db > 0).length + '</span>';
+  allBtn.title = 'แสดงทั้งวัน';
+  allBtn.onclick = () => {
+    filterHourStart = null;
+    filterHourEnd   = null;
+    chips.querySelectorAll('.day-chip').forEach(c => c.classList.remove('day-chip-active'));
+    allBtn.classList.add('day-chip-active');
+    renderDayChart();
+  };
+  chips.appendChild(allBtn);
+
+  hours.forEach(h => {
+    const info = hourMap[h];
+    const isSel = filterHourStart === h && filterHourEnd === h;
+    const chip = document.createElement('button');
+    chip.className = 'day-chip' + (isSel ? ' day-chip-active' : '');
+    chip.style.cssText = 'min-width:52px;';
+    chip.title = String(h).padStart(2,'0') + ':00 – ' + String(h+1).padStart(2,'0') + ':00  ·  ' + info.count + ' records  ·  max ' + info.dbMax.toFixed(1) + ' dB';
+    chip.innerHTML =
+      '<span class="chip-date" style="font-size:.7rem;">' + String(h).padStart(2,'0') + ':00</span>' +
+      '<span class="chip-cnt">' + info.count + '</span>';
+    chip.onclick = () => {
+      filterHourStart = h;
+      filterHourEnd   = h;
+      chips.querySelectorAll('.day-chip').forEach(c => c.classList.remove('day-chip-active'));
+      chip.classList.add('day-chip-active');
+      renderDayChart();
+    };
+    chips.appendChild(chip);
+  });
+}
+
+function clearAvailPanel() {
+  const ph    = document.getElementById('avail-placeholder');
+  const chips = document.getElementById('avail-chips');
+  const bars  = document.getElementById('avail-bars');
+  const total = document.getElementById('avail-total');
+  const dayContainer = document.getElementById('avail-day-chips');
+  const dayLabel     = document.getElementById('avail-day-label');
+  const hourLabel    = document.getElementById('avail-hour-label');
+  if (ph) { ph.textContent = 'รอโหลดข้อมูล…'; ph.style.display = 'block'; }
+  if (chips) { chips.innerHTML = ''; chips.style.display = 'none'; }
+  if (bars)  { bars.innerHTML = ''; bars.style.display = 'none'; }
+  if (total) total.textContent = '';
+  if (dayContainer) { dayContainer.innerHTML = ''; dayContainer.style.display = 'none'; }
+  if (dayLabel)  dayLabel.style.display = 'none';
+  if (hourLabel) hourLabel.style.display = 'none';
+}
+
+// ── Chart ─────────────────────────────────────────────────────
+function onDateChange() {
+  const dp = document.getElementById('graph-date');
+  filterDate = dp ? dp.value : null;
+  filterHourStart = null;
+  filterHourEnd   = null;
+  renderDayChart();
+}
+
+function setGraphRange(n, btn) {
+  graphRange = n;
+  document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active-btn'));
+  if (btn) btn.classList.add('active-btn');
+  renderDayChart();
+}
+
+function jumpToLatestDate() {
+  if (!allPoints.length) return;
+  const valid = allPoints.filter(p => p.db > 0);
+  if (!valid.length) return;
+  const ymd = toYMD(valid[valid.length-1].time);
+  const dp = document.getElementById('graph-date');
+  if (dp) { dp.value = ymd; filterDate = ymd; }
+  filterHourStart = null;
+  filterHourEnd   = null;
+  renderDayChart();
+  // อัปเดต day chip
+  const dayContainer = document.getElementById('avail-day-chips');
+  if (dayContainer) {
+    dayContainer.querySelectorAll('.day-chip').forEach(c => {
+      c.classList.toggle('day-chip-active', c.title.startsWith(ymd));
+    });
+  }
+}
+
+function renderDayChart() {
+  const valid = allPoints.filter(p => p.db > 0);
+  let pts = [];
+
+  if (filterDate) {
+    let dayPts = valid.filter(p => toYMD(p.time) === filterDate);
+    // filter ตามช่วงชั่วโมงที่เลือก
+    if (filterHourStart !== null && filterHourEnd !== null) {
+      dayPts = dayPts.filter(p => {
+        const h = p.time.getHours();
+        return h >= filterHourStart && h <= filterHourEnd;
+      });
+    }
+    pts = graphRange > 0 ? dayPts.slice(-graphRange) : dayPts;
+  }
+
+  if (pts.length < 1) {
+    showPlaceholder(true);
+    if (soundChart) { soundChart.destroy(); soundChart = null; }
+    ['ws-latest','ws-max','ws-min','ws-avg'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.textContent = '—'; el.closest('.wav-stat')?.classList.add('empty'); }
+    });
+    return;
+  }
+  showPlaceholder(false);
+  soundChart = drawChart('soundChart', pts, soundChart, ['ws-latest','ws-max','ws-min','ws-avg']);
+}
+
+function drawChart(canvasId, pts, existingChart, statIds) {
+  const dbs  = pts.map(p => p.db);
+  const lbls = pts.map(p => fmtTime(p.time));
+  const showDots = pts.length <= 60;
+  setStatVal(statIds[0], dbs[dbs.length-1].toFixed(1) + ' dB');
+  setStatVal(statIds[1], Math.max(...dbs).toFixed(1) + ' dB');
+  setStatVal(statIds[2], Math.min(...dbs).toFixed(1) + ' dB');
+  setStatVal(statIds[3], (dbs.reduce((a,b) => a+b, 0) / dbs.length).toFixed(1) + ' dB');
+  if (!existingChart) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return null;
+    return new Chart(canvas, {
+      type: 'line',
+      data: { labels: lbls, datasets: [{ label: 'dB SPL', data: dbs, borderColor: '#3182ce', backgroundColor: 'rgba(49,130,206,.1)', pointBackgroundColor: '#0bc5ea', pointBorderColor: '#3182ce', pointBorderWidth: 1.5, pointRadius: showDots ? 4 : 0, pointHoverRadius: 7, tension: 0.35, fill: true, borderWidth: 2.5 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: { backgroundColor: '#1e293b', borderColor: 'rgba(255,255,255,.12)', borderWidth: 1, titleColor: '#94a3b8', bodyColor: '#e2e8f0', padding: 12,
+            callbacks: { title: ctx => ctx[0].label, label: ctx => { const pt = pts[ctx.dataIndex]; const out = [' dB SPL:  ' + ctx.raw.toFixed(1)]; if (pt && pt.temp !== null) out.push(' 🌡  ' + pt.temp.toFixed(1) + ' °C'); if (pt && pt.hum !== null) out.push(' 💧  ' + pt.hum.toFixed(1) + ' %'); if (pt && pt.filename) out.push(' 📁  ' + pt.filename); return out; } }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: 'Time', color: '#64748b', font: { size: 11, family: 'IBM Plex Mono, monospace' } }, ticks: { color: '#64748b', font: { size: 11, family: 'IBM Plex Mono, monospace' }, maxRotation: 45, autoSkip: true, maxTicksLimit: 10 }, grid: { color: 'rgba(0,0,0,.06)' } },
+          y: { title: { display: true, text: 'dB SPL', color: '#64748b', font: { size: 11, family: 'IBM Plex Mono, monospace' } }, ticks: { color: '#64748b', font: { size: 11, family: 'IBM Plex Mono, monospace' }, callback: v => v + ' dB' }, grid: { color: 'rgba(0,0,0,.06)' } }
+        }
+      }
+    });
+  } else {
+    existingChart.data.labels = lbls;
+    existingChart.data.datasets[0].data = dbs;
+    existingChart.data.datasets[0].pointRadius = showDots ? 4 : 0;
+    existingChart.update('active');
+    return existingChart;
+  }
+}
+
+function showPlaceholder(show) {
+  const ph   = document.getElementById('wav-placeholder');
+  const wrap = document.getElementById('chart-wrap');
+  if (ph)   ph.style.display   = show ? '' : 'none';
+  if (wrap) wrap.style.display = show ? 'none' : 'block';
+}
+
+// ── AI ────────────────────────────────────────────────────────
+function onFileSelected(event) {
+  const file = event.target.files[0]; if (!file) return;
+  selectedFile = file;
+  const zone = document.getElementById('upload-zone'), label = document.getElementById('upload-label'), btn = document.getElementById('ai-analyze-btn'), player = document.getElementById('wav-player');
+  if (zone) zone.classList.add('has-file');
+  if (label) label.textContent = '✓ ' + file.name;
+  if (btn) btn.disabled = false;
+  if (player) { if (player.src) URL.revokeObjectURL(player.src); player.src = URL.createObjectURL(file); player.style.display = 'block'; }
+  const res = document.getElementById('ai-result'), err = document.getElementById('ai-error');
+  if (res) res.style.display = 'none';
+  if (err) err.style.display = 'none';
+}
+
+async function runAI() {
+  if (!selectedFile) return;
+  const btn = document.getElementById('ai-analyze-btn'), res = document.getElementById('ai-result'), err = document.getElementById('ai-error');
+  if (btn) { btn.disabled = true; btn.classList.add('loading'); btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation:spin .8s linear infinite"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg> กำลังวิเคราะห์…'; }
+  if (res) res.style.display = 'none';
+  if (err) err.style.display = 'none';
+
+  try {
+    const { Client, handle_file } = await import('https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js');
+
+    // ใส่ Token ใน hf_token เพื่อยืนยันตัวตนขอกวอต้าเพิ่ม
+    const client = await Client.connect('.....'// <-- name hugging face , {
+      hf_token: '....' // <-- นำ Token read จาก Hugging Face มาวางที่นี่
+    });
+
+    const result = await client.predict('/analyze_audio_1', {
+      audio_filepath: handle_file(selectedFile)
+    });
+
+    const data = result.data;
+    let pred = data[2] || '—';
+    pred = pred.replace(/\s*\(.*?\)\s*$/, '').trim(); // ตัดวงเล็บ (ความมั่นใจ ...%) ท้ายข้อความทิ้ง
+
+    const confObj = data[0];
+    let confStr = '—';
+
+    if (confObj && typeof confObj === 'object') {
+      const label = confObj.label || '';
+      const confs = confObj.confidences || [];
+      const top = confs.find(c => c.label === label) || confs[0];
+      if (top && top.confidence !== undefined) {
+        confStr = (top.confidence * 100).toFixed(1) + '%';
+      } else if (label) {
+        confStr = label;
+      }
+    }
+
+    setText('ai-pred', pred);
+    setText('ai-conf', confStr);
+
+    if (res) res.style.display = 'block';
+  } catch (e) {
+    if (err) { err.textContent = 'Error: ' + (e.message || e); err.style.display = 'block'; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('loading'); btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> วิเคราะห์เสียง'; }
+  }
+}
+
+// ── Misc ──────────────────────────────────────────────────────
+function manualRefresh() {
+  const btn = document.getElementById('btn-reload');
+  if (btn) { btn.classList.add('spinning'); setTimeout(() => btn.classList.remove('spinning'), 700); }
+  filterHourStart = null; filterHourEnd = null;
+  clearUI(); loadSheetList(); loadConfig();
+}
+
+function clearUI() {
+  if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
+  setHTML('val-temp', '--<span class="unit">°C</span>');
+  setHTML('val-hum',  '--<span class="unit">%</span>');
+  const recEl = document.getElementById('val-record'); if (recEl) { recEl.textContent = '—'; recEl.className = 'status-big s-orange'; }
+  setText('sub-record', 'รอข้อมูล…');
+  const sdEl = document.getElementById('val-sd'); if (sdEl) { sdEl.textContent = '—'; sdEl.className = 'status-big s-orange'; }
+  setText('sub-sd', 'รอข้อมูล…');
+  setText('val-filename', '—'); setText('last-ts', '—');
+  ['ws-latest','ws-max','ws-min','ws-avg'].forEach(id => { const el = document.getElementById(id); if (el) { el.textContent = '—'; el.closest('.wav-stat')?.classList.add('empty'); } });
+  allPoints = []; showPlaceholder(true);
+  if (soundChart) { soundChart.destroy(); soundChart = null; }
+  clearAvailPanel();
+  const tbody = document.getElementById('hist-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-sm);padding:16px;">รอข้อมูล…</td></tr>';
+}
+
+function setDisconnected() {
+  setBadgeConn(false);
+  setHTML('val-temp', '--<span class="unit">°C</span>');
+  setHTML('val-hum',  '--<span class="unit">%</span>');
+  const recEl = document.getElementById('val-record'); if (recEl) { recEl.textContent = '—'; recEl.className = 'status-big s-orange'; }
+  setText('sub-record', 'ไม่มีการเชื่อมต่อ');
+  const sdEl = document.getElementById('val-sd'); if (sdEl) { sdEl.textContent = '—'; sdEl.className = 'status-big s-orange'; }
+  setText('sub-sd', 'ไม่มีการเชื่อมต่อ');
+  setText('val-filename', '—');
+}
+
+function showToast(msg, type) {
+  const t = document.getElementById('record-toast'); if (!t) return;
+  t.textContent = msg; t.className = 'record-toast ' + (type || 'ok'); t.style.display = 'block'; t.style.opacity = '1';
+  clearTimeout(t._timer); t._timer = setTimeout(() => { t.style.opacity = '0'; setTimeout(() => { t.style.display = 'none'; }, 350); }, 3000);
+}
+
+function toYMD(dt) { if (!(dt instanceof Date) || isNaN(dt)) return ''; const p = n => String(n).padStart(2,'0'); return dt.getFullYear() + '-' + p(dt.getMonth()+1) + '-' + p(dt.getDate()); }
+
+function setBadgeWifi(online) { const b = document.getElementById('badge-wifi'); if (!b) return; b.className = 'conn-badge ' + (online ? 'connected' : 'disconnected'); b.innerHTML = '<span class="conn-dot"></span>' + (online ? 'WiFi' : 'Offline'); }
+function setBadgeRec(recording) { const b = document.getElementById('badge-rec'); if (!b) return; if (recording) { b.style.cssText = 'background:#22c55e;color:#fff;box-shadow:0 2px 10px rgba(34,197,94,.4);'; b.innerHTML = '<span class="conn-dot"></span>กำลังอัด'; } else { b.style.cssText = 'background:#718096;color:#fff;box-shadow:none;'; b.innerHTML = '<span class="conn-dot"></span>ไม่อัด'; } }
+function setBadgeConn(ok) { setBadgeWifi(ok); }
+function setStatVal(id, val) { const el = document.getElementById(id); if (!el) return; el.textContent = val; el.closest('.wav-stat')?.classList.remove('empty'); }
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+function setHTML(id, v) { const el = document.getElementById(id); if (el) el.innerHTML = v; }
+function fmtN(v, d) { const n = parseFloat(v); return isNaN(n) ? '—' : n.toFixed(d); }
+function fmtTime(dt) { if (!(dt instanceof Date) || isNaN(dt)) return '—'; const p = n => String(n).padStart(2,'0'); return `${p(dt.getDate())}/${p(dt.getMonth()+1)} ${p(dt.getHours())}:${p(dt.getMinutes())}`; }
+</script>
