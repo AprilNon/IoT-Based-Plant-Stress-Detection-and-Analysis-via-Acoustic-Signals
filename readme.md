@@ -21,7 +21,21 @@
 1. ทำ **กล่องเก็บเสียง (soundproof box)** ขึ้นเองเพื่อลดเสียงรบกวนจากภายนอกขณะบันทึก
 2. ทำ **โพรงด้วยดินน้ำมัน** ติดบริเวณลำต้นของพืชแต่ละต้น เพื่อเป็นจุดติดตั้งเซนเซอร์/ไมโครโฟนสำหรับรับสัญญาณเสียงจากลำต้นโดยตรง
 3. นำพืชแต่ละต้นเข้าไปวัดและบันทึกเสียงภายในกล่องเก็บเสียงที่เตรียมไว้ แยกไฟล์ตามคลาส (`Plant_Sounds` / `Normal`) ส่วนคลาส `Noise` เก็บจากเสียงรบกวนทั่วไปที่ไม่ใช่เสียงจากพืช
-4. ไฟล์เสียงทั้งหมดเป็น `.wav` ความยาวสั้น (~1 วินาที/ไฟล์) เก็บไว้ในโฟลเดอร์ `data/Plant_Sounds/` แยกตามคลาส
+4. บันทึกเสียงที่ **Sample Rate 32kHz ความยาวไฟล์ละ 10 วินาที**
+
+**การประมวลผลข้อมูลเสียงก่อนนำไปเทรน (Preprocessing):**
+
+หลังบันทึกเสียงดิบมาแล้ว จะนำไฟล์ไปผ่านขั้นตอนเตรียมข้อมูลตามลำดับดังนี้ ก่อนนำเข้าโมเดล HuBERT:
+
+1. **ตัดความยาว (Trim)** — ตัดจากไฟล์ต้นฉบับ 10 วินาที ให้เหลือ **1 วินาที** ต่อไฟล์
+2. **High-pass Filter ที่ 500Hz** — กรองความถี่ต่ำกว่า 500Hz ออก เพื่อลดสัญญาณรบกวนความถี่ต่ำ (เช่น เสียงสั่นสะเทือน/ฮัมของอุปกรณ์)
+3. **Normalization ที่ -1dB** — ปรับระดับความดังของสัญญาณให้อยู่ในระดับมาตรฐานเดียวกันทุกไฟล์
+4. **Noise Reduction** — ลดเสียงรบกวนพื้นหลัง (background noise) ที่หลงเหลืออยู่ในสัญญาณ
+5. **Downsample เหลือ 16kHz** — ลด Sample Rate จาก 32kHz เหลือ **16kHz** ให้ตรงกับ input ที่โมเดล HuBERT ต้องการ ก่อนนำไปเทรน
+
+ขั้นตอนนี้ทำอยู่ใน notebook `ai-model/notebook/HuBERT Audio Classifier: Plant_Sounds vs Normal vs Noise.ipynb` ก่อนขั้นตอน Fine-tune โมเดล
+
+ไฟล์เสียงทั้งหมด (ทั้งไฟล์ดิบ 32kHz/10วิ และ/หรือไฟล์ที่ผ่าน preprocessing แล้ว) เก็บไว้ในโฟลเดอร์ `data/Plant_Sounds/` แยกตามคลาส
 
 ## 📌 ภาพรวมระบบ (System Overview)
 
@@ -66,7 +80,7 @@ IoT-Based-Plant-Stress-Detection-and-Analysis-via-Acoustic-Signals/
 ├── model/                       # โมเดลที่เทรนเสร็จแล้ว (checkpoint/.pt)
 │   └── *.pt                    # ไฟล์น้ำหนักโมเดล (จัดการผ่าน Git LFS เนื่องจากไฟล์มีขนาดใหญ่)
 │
-├── docs/                        # เอกสารประกอบ, ไดอะแกรม
+├── docs/                        # เอกสารประกอบ, ไดอะแกรม, ภาพหน้าจอ
 │
 ├── app.py                      # สคริปต์ Gradio App — ใช้ deploy โมเดลบน Hugging Face Spaces (ดูตัวอย่างที่ deploy แล้วด้านล่าง)
 ├── requirements.txt             # รายชื่อ Python dependencies
@@ -152,7 +166,7 @@ pip install -r requirements.txt
 
 - **Base model:** HuBERT (Hidden-unit BERT) สำหรับงาน audio/speech representation
 - **Task:** Multi-class classification (3 คลาส) — `Plant_Sounds` (เสียงเครียดจากขาดน้ำ) vs `Normal` (สภาวะปกติ) vs `Noise` (เสียงรบกวน)
-- **ชุดข้อมูล:** ไฟล์เสียง `.wav` ความยาวสั้น (~1 วินาที) เก็บจากต้นพลูด่าง 2 ต้น (ปกติ 1 ต้น / ขาดน้ำ 1 ต้น) ในกล่องเก็บเสียง — ดูรายละเอียดที่หัวข้อ [🌿 เกี่ยวกับชุดข้อมูล](#-เกี่ยวกับชุดข้อมูล-dataset--การเก็บข้อมูล) ด้านบน
+- **ชุดข้อมูล:** บันทึกเสียงดิบที่ 32kHz ความยาว 10 วินาที/ไฟล์ จากต้นพลูด่าง 2 ต้น (ปกติ 1 ต้น / ขาดน้ำ 1 ต้น) ในกล่องเก็บเสียง แล้วผ่านการประมวลผล (ตัดเหลือ 1 วินาที → High-pass filter 500Hz → Normalize -1dB → Noise Reduction → Downsample เหลือ 16kHz) ก่อนนำไปเทรน — ดูรายละเอียดที่หัวข้อ [🌿 เกี่ยวกับชุดข้อมูล](#-เกี่ยวกับชุดข้อมูล-dataset--การเก็บข้อมูล) ด้านบน
 - **Demo ที่ deploy แล้ว:** [huggingface.co/spaces/NonSittinon/HuBERT-Plant_Audio_Classifier](https://huggingface.co/spaces/NonSittinon/HuBERT-Plant_Audio_Classifier) — อัปโหลดไฟล์เสียงแล้วดูผลจำแนกพร้อมค่าความมั่นใจของแต่ละคลาสได้ทันที
 
 > ⚠️ ไฟล์โมเดล (`.pt`) มีขนาดใหญ่ (~300 MB) จึงจัดการผ่าน **Git LFS** — ก่อน clone repo ให้ติดตั้ง [Git LFS](https://git-lfs.com/) แล้วรัน `git lfs pull` เพื่อดึงไฟล์โมเดลลงมาให้ครบ
@@ -205,7 +219,6 @@ git lfs pull
 
 ## 👥 ผู้จัดทำ
 
-1. **Mr. Sittinon	  Yongyutwichai**
-2. **Mr. Benjarong	Kanthajai**
-3. **Mr. Norrapat	  Supa**
-
+1. **Mr. Sittinon Yongyutwichai**
+2. **Mr. Benjarong Kanthajai**
+3. **Mr. Norrapat Supa**
