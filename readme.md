@@ -59,14 +59,14 @@ IoT-Based-Plant-Stress-Detection-and-Analysis-via-Acoustic-Signals/
 │
 ├── data/                       # ชุดข้อมูลเสียงสำหรับเทรน/ทดสอบโมเดล (3 คลาส)
 │   └── Plant_Sounds/
-│       ├── Plant_Sounds/        # ไฟล์เสียงพืช (.wav)
-│       ├── Normal/               # ไฟล์เสียงทั่วไป/ปกติ (.wav)
+│       ├── Plant_Sounds/        # ไฟล์เสียงพืชสภาวะเครียดจากการขาดน้ำ (.wav)
+│       ├── Normal/               # ไฟล์เสียงพืชสภาวะปกติ (.wav)
 │       └── Noise/                 # ไฟล์เสียงรบกวน (.wav)
 │
 ├── model/                       # โมเดลที่เทรนเสร็จแล้ว (checkpoint/.pt)
 │   └── *.pt                    # ไฟล์น้ำหนักโมเดล (จัดการผ่าน Git LFS เนื่องจากไฟล์มีขนาดใหญ่)
 │
-├── docs/                        # เอกสารประกอบ, ไดอะแกรม, ภาพหน้าจอ
+├── docs/                        # เอกสารประกอบ, ไดอะแกรม
 │
 ├── app.py                      # สคริปต์ Gradio App — ใช้ deploy โมเดลบน Hugging Face Spaces (ดูตัวอย่างที่ deploy แล้วด้านล่าง)
 ├── requirements.txt             # รายชื่อ Python dependencies
@@ -205,8 +205,7 @@ git lfs pull
 
 ## 👥 ผู้จัดทำ
 
-โปรเจกต์นี้เป็นส่วนหนึ่งของวิชา ENGCE301
+Mr. Sittinon	Yongyutwichai
+Mr. Benjarong	Kanthajai
+Mr. Norrapat	Supa
 
-## 📄 License
-
-ระบุ License ของโปรเจกต์ที่นี่ (เช่น MIT, Apache 2.0) หากยังไม่มีไฟล์ `LICENSE` แนะนำให้เพิ่มเข้าไปในโปรเจกต์
