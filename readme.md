@@ -205,7 +205,7 @@ git lfs pull
 
 ## 👥 ผู้จัดทำ
 
-Mr. Sittinon	Yongyutwichai
-Mr. Benjarong	Kanthajai
-Mr. Norrapat	Supa
+**Mr. Sittinon	  Yongyutwichai**
+**Mr. Benjarong	  Kanthajai**
+**Mr. Norrapat	  Supa**
 
